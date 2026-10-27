@@ -1,0 +1,57 @@
+name: Build Immich Desktop Portable (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC C++ Compiler
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.6.2'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          modules: 'qtimageformats qtsvg'
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" `
+            -G "Visual Studio 17 2022" -A x64
+
+      - name: Build C++ Executable
+        run: |
+          cmake --build build --config Release --parallel
+
+      - name: Deploy Qt Runtime Libraries (windeployqt)
+        shell: pwsh
+        run: |
+          $exePath = (Get-ChildItem -Path build -Filter "immich-desktop.exe" -Recurse).FullName[0]
+          $binDir = Split-Path $exePath
+          Write-Host "Found exe at: $exePath"
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations --compiler-runtime $exePath
+          
+          # Create a clean portable folder
+          New-Item -ItemType Directory -Force -Path dist/Immich-Desktop-Portable
+          Copy-Item -Path "$binDir\*" -Destination dist/Immich-Desktop-Portable -Recurse
+
+      - name: Upload Finished Portable App
+        uses: actions/upload-artifact@v4
+        with:
+          name: Immich-Desktop-Windows-Portable
+          path: dist/Immich-Desktop-Portable/
