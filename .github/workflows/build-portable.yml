@@ -18,37 +18,46 @@ jobs:
       - name: Setup MSVC C++ Compiler
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install Qt 6
-        uses: jurplel/install-qt-action@v3
+      - name: Setup Ninja
+        uses: ashutoshvarma/setup-ninja@master
         with:
-          version: '6.6.2'
-          host: 'windows'
-          target: 'desktop'
-          arch: 'win64_msvc2019_64'
-          modules: 'qtimageformats qtsvg'
+          version: 1.11.1
+
+      - name: Install Qt 6 via aqtinstall
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install aqtinstall
+          aqt install-qt windows desktop 6.6.2 win64_msvc2019_64 --outputdir C:\Qt -m qtimageformats qtsvg
 
       - name: Configure CMake
+        shell: pwsh
         run: |
-          cmake -B build -S . `
+          $qtPath = "C:\Qt\6.6.2\msvc2019_64"
+          cmake -B build -S . -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" `
-            -G "Visual Studio 17 2022" -A x64
+            -DCMAKE_PREFIX_PATH="$qtPath"
 
       - name: Build C++ Executable
+        shell: pwsh
         run: |
           cmake --build build --config Release --parallel
 
-      - name: Deploy Qt Runtime Libraries (windeployqt)
+      - name: Package Portable Directory (windeployqt)
         shell: pwsh
         run: |
-          $exePath = (Get-ChildItem -Path build -Filter "immich-desktop.exe" -Recurse).FullName[0]
-          $binDir = Split-Path $exePath
-          Write-Host "Found exe at: $exePath"
-          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations --compiler-runtime $exePath
+          $qtBin = "C:\Qt\6.6.2\msvc2019_64\bin"
+          $exe = Get-ChildItem -Path build -Filter "*.exe" -Recurse | Where-Object { $_.Name -notlike "*test*" } | Select-Object -First 1
+          if (-not $exe) { throw "Executable not found!" }
           
-          # Create a clean portable folder
+          Write-Host "Target executable found at: $($exe.FullName)"
+          
+          # Run windeployqt to bundle DLLs
+          & "$qtBin\windeployqt.exe" --release --no-translations --compiler-runtime "$($exe.FullName)"
+
+          # Copy everything into the output folder
           New-Item -ItemType Directory -Force -Path dist/Immich-Desktop-Portable
-          Copy-Item -Path "$binDir\*" -Destination dist/Immich-Desktop-Portable -Recurse
+          Copy-Item -Path "$($exe.DirectoryName)\*" -Destination dist/Immich-Desktop-Portable -Recurse
 
       - name: Upload Finished Portable App
         uses: actions/upload-artifact@v4
