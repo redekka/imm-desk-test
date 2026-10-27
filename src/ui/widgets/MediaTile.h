@@ -3,6 +3,7 @@
 #include "core/ImmichTypes.h"
 
 #include <QPixmap>
+#include <QRect>
 #include <QWidget>
 
 class QContextMenuEvent;
@@ -64,6 +65,10 @@ protected:
 private:
     static QString formatDuration(const QString &raw);
 
+    QRect copyButtonRect() const;
+    QRect trashButtonRect() const;
+    QRect deleteButtonRect() const;
+
     VideoHoverPreview *m_hoverPreview = nullptr;
     ImmichAsset m_asset;
     QPixmap m_thumbnail;
@@ -75,6 +80,7 @@ private:
     bool m_hoverPreviewActive = false;
     bool m_leftPressed = false;
     bool m_pressBecameDrag = false;
+    bool m_hovered = false;
 };
 
 } // namespace Aurora
