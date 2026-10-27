@@ -74,7 +74,6 @@ void MediaTile::endHoverPreview()
 
 void MediaTile::setThumbnail(const QPixmap &thumbnail)
 {
-    // A late small thumbnail must not replace a sharper image loaded for zoom.
     if (qMax(thumbnail.width(), thumbnail.height()) < thumbnailDimension())
         return;
     m_thumbnail = thumbnail;
@@ -138,6 +137,21 @@ QString MediaTile::formatDuration(const QString &raw)
     return duration;
 }
 
+QRect MediaTile::copyButtonRect() const
+{
+    return QRect(6, 6, 26, 26);
+}
+
+QRect MediaTile::trashButtonRect() const
+{
+    return QRect(36, 6, 26, 26);
+}
+
+QRect MediaTile::deleteButtonRect() const
+{
+    return QRect(66, 6, 26, 26);
+}
+
 void MediaTile::paintEvent(QPaintEvent *)
 {
     QPainter painter(this);
@@ -147,8 +161,6 @@ void MediaTile::paintEvent(QPaintEvent *)
     painter.fillRect(rect(), QColor(20, 20, 20));
 
     if (!m_thumbnail.isNull()) {
-        // Crop+scale in the draw call so we don't keep a second full pixmap
-        // per tile (scaled cache roughly doubled RAM for the timeline).
         const QSizeF tileSize = size();
         const QSizeF srcSize = m_thumbnail.size();
         const qreal scale =
@@ -228,6 +240,33 @@ void MediaTile::paintEvent(QPaintEvent *)
         }
     }
 
+    // --- REQUIREMENT 1: Hover Action Buttons (Copy, Move to Trash, Permanent Delete) ---
+    if (m_hovered && !m_asset.isLocalPending()) {
+        painter.setPen(Qt::NoPen);
+
+        // 1. Copy Button (📋)
+        if (!m_asset.isVideo()) {
+            painter.setBrush(QColor(0, 0, 0, 170));
+            painter.drawRoundedRect(copyButtonRect(), 4, 4);
+            painter.setPen(Qt::white);
+            painter.drawText(copyButtonRect(), Qt::AlignCenter, QStringLiteral("📋"));
+        }
+
+        // 2. Trash Button (🗑️)
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(0, 0, 0, 170));
+        painter.drawRoundedRect(trashButtonRect(), 4, 4);
+        painter.setPen(Qt::white);
+        painter.drawText(trashButtonRect(), Qt::AlignCenter, QStringLiteral("🗑️"));
+
+        // 3. Permanent Delete Button (⚠️)
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(180, 20, 20, 200));
+        painter.drawRoundedRect(deleteButtonRect(), 4, 4);
+        painter.setPen(Qt::white);
+        painter.drawText(deleteButtonRect(), Qt::AlignCenter, QStringLiteral("⚠️"));
+    }
+
     if (hasFocus()) {
         painter.setPen(QPen(QColor(166, 133, 226), 2));
         painter.setBrush(Qt::NoBrush);
@@ -237,21 +276,23 @@ void MediaTile::paintEvent(QPaintEvent *)
 
 void MediaTile::enterEvent(QEnterEvent *event)
 {
+    m_hovered = true;
+    update();
     emit highlighted(m_asset);
     if (m_hoverPreview && m_asset.isVideo() && !m_asset.isLocalPending()) {
         m_hoverPreviewActive = true;
         m_hoverPreview->showForTile(this);
-        update();
     }
     QWidget::enterEvent(event);
 }
 
 void MediaTile::leaveEvent(QEvent *event)
 {
+    m_hovered = false;
+    update();
     if (m_hoverPreview && m_hoverPreviewActive) {
         m_hoverPreviewActive = false;
         m_hoverPreview->hideForTile(this);
-        update();
     }
     QWidget::leaveEvent(event);
 }
@@ -282,9 +323,30 @@ void MediaTile::keyPressEvent(QKeyEvent *event)
 void MediaTile::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
+        const QPoint clickPos = event->position().toPoint();
+
+        // Check if user clicked any of the 3 hover action buttons
+        if (m_hovered && !m_asset.isLocalPending()) {
+            if (!m_asset.isVideo() && copyButtonRect().contains(clickPos)) {
+                emit copyRequested(m_asset);
+                event->accept();
+                return;
+            }
+            if (trashButtonRect().contains(clickPos)) {
+                emit trashRequested(m_asset);
+                event->accept();
+                return;
+            }
+            if (deleteButtonRect().contains(clickPos)) {
+                emit deleteRequested(m_asset);
+                event->accept();
+                return;
+            }
+        }
+
         m_leftPressed = true;
         m_pressBecameDrag = false;
-        m_pressPos = event->position().toPoint();
+        m_pressPos = clickPos;
         setFocus(Qt::MouseFocusReason);
         emit highlighted(m_asset);
     }
@@ -304,7 +366,6 @@ void MediaTile::mouseMoveEvent(QMouseEvent *event)
 void MediaTile::mouseReleaseEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
-        // Ignore release after a drag/scroll so timeline scrolling does not open media.
         if (m_leftPressed && !m_pressBecameDrag &&
             rect().contains(event->position().toPoint()))
             emit activated(m_asset);
