@@ -28,7 +28,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install aqtinstall
-          aqt install-qt windows desktop 6.6.2 win64_msvc2019_64 --outputdir C:\Qt -m qtimageformats qtsvg
+          aqt install-qt windows desktop 6.6.2 win64_msvc2019_64 --outputdir C:\Qt -m qtimageformats
 
       - name: Configure CMake
         shell: pwsh
@@ -52,10 +52,8 @@ jobs:
           
           Write-Host "Target executable found at: $($exe.FullName)"
           
-          # Run windeployqt to bundle DLLs
           & "$qtBin\windeployqt.exe" --release --no-translations --compiler-runtime "$($exe.FullName)"
 
-          # Copy everything into the output folder
           New-Item -ItemType Directory -Force -Path dist/Immich-Desktop-Portable
           Copy-Item -Path "$($exe.DirectoryName)\*" -Destination dist/Immich-Desktop-Portable -Recurse
 
