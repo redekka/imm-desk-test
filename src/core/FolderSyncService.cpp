@@ -11,12 +11,16 @@
 #include <QFileInfo>
 #include <QFileSystemWatcher>
 #include <QImageReader>
-#include <QJsonDocument>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
-#include <QStandardPaths>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QSaveFile>
+#include <QStandardPaths>
 #include <QTimer>
+#include <QUrl>
 
 #include <algorithm>
 #include <iterator>
@@ -209,8 +213,8 @@ void FolderSyncService::handleUploadProgress(const QString &filePath, qint64, qi
     publishLibraryPending();
 }
 
-void FolderSyncService::handleAssetUploaded(const QString &filePath, const QString &,
-                                            bool)
+void FolderSyncService::handleAssetUploaded(const QString &filePath, const QString &assetId,
+                                           bool)
 {
     if (!isUnderSyncFolder(filePath))
         return;
@@ -219,6 +223,80 @@ void FolderSyncService::handleAssetUploaded(const QString &filePath, const QStri
     m_errors.remove(filePath);
     markSynced(filePath);
     m_lastUploadName = QFileInfo(filePath).fileName();
+
+    // --- REQUIREMENT 2: Automatically Add Uploaded Asset to Album Named After Folder ---
+    if (!assetId.isEmpty() && m_client && m_client->isConfigured()) {
+        const QFileInfo fileInfo(filePath);
+        const QString albumName = fileInfo.dir().dirName();
+        if (!albumName.isEmpty()) {
+            const QString apiKey = m_client->connection().apiKey;
+            const QString baseServerUrl = m_client->activeServerUrl();
+
+            auto *nam = new QNetworkAccessManager(this);
+
+            // Step A: Search for existing album with this name
+            QUrl albumsUrl(baseServerUrl + QStringLiteral("/api/albums"));
+            QNetworkRequest getRequest(albumsUrl);
+            getRequest.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+            getRequest.setRawHeader("x-api-key", apiKey.toUtf8());
+
+            QNetworkReply *getReply = nam->get(getRequest);
+            connect(getReply, &QNetworkReply::finished, this, [this, getReply, nam, albumsUrl, apiKey, albumName, assetId]() {
+                QString existingAlbumId;
+                if (getReply->error() == QNetworkReply::NoError) {
+                    const QJsonDocument doc = QJsonDocument::fromJson(getReply->readAll());
+                    if (doc.isArray()) {
+                        const QJsonArray albums = doc.array();
+                        for (const auto &val : albums) {
+                            const QJsonObject obj = val.toObject();
+                            if (obj.value(QStringLiteral("albumName")).toString().compare(albumName, Qt::CaseInsensitive) == 0) {
+                                existingAlbumId = obj.value(QStringLiteral("id")).toString();
+                                break;
+                            }
+                        }
+                    }
+                }
+                getReply->deleteLater();
+
+                if (!existingAlbumId.isEmpty()) {
+                    // Step B1: Album exists -> Append asset to album via PUT /api/albums/{id}/assets
+                    QUrl putUrl(QStringLiteral("%1/%2/assets").arg(albumsUrl.toString(), existingAlbumId));
+                    QNetworkRequest putRequest(putUrl);
+                    putRequest.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+                    putRequest.setRawHeader("x-api-key", apiKey.toUtf8());
+
+                    QJsonObject putBody;
+                    QJsonArray idsArray;
+                    idsArray.append(assetId);
+                    putBody.insert(QStringLiteral("ids"), idsArray);
+
+                    QNetworkReply *putReply = nam->put(putRequest, QJsonDocument(putBody).toJson(QJsonDocument::Compact));
+                    connect(putReply, &QNetworkReply::finished, this, [putReply, nam]() {
+                        putReply->deleteLater();
+                        nam->deleteLater();
+                    });
+                } else {
+                    // Step B2: Album does not exist -> Create album with this asset via POST /api/albums
+                    QNetworkRequest postRequest(albumsUrl);
+                    postRequest.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+                    postRequest.setRawHeader("x-api-key", apiKey.toUtf8());
+
+                    QJsonObject postBody;
+                    postBody.insert(QStringLiteral("albumName"), albumName);
+                    QJsonArray assetIdsArray;
+                    assetIdsArray.append(assetId);
+                    postBody.insert(QStringLiteral("assetIds"), assetIdsArray);
+
+                    QNetworkReply *postReply = nam->post(postRequest, QJsonDocument(postBody).toJson(QJsonDocument::Compact));
+                    connect(postReply, &QNetworkReply::finished, this, [postReply, nam]() {
+                        postReply->deleteLater();
+                        nam->deleteLater();
+                    });
+                }
+            });
+        }
+    }
+
     refreshStatus();
     publishLibraryPending();
 }
@@ -427,8 +505,6 @@ void FolderSyncService::loadSyncedState()
     if (!file.open(QIODevice::ReadOnly))
         return;
     const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
-    // Fingerprints are keyed by absolute file path. Keep them when adding,
-    // removing, or reordering roots, including the legacy single-folder state.
     const QJsonObject files = root.value(QStringLiteral("files")).toObject();
     for (auto it = files.begin(); it != files.end(); ++it)
         m_syncedFingerprints.insert(it.key(), it.value().toString());
@@ -621,8 +697,8 @@ QStringList FolderSyncService::collectMediaFiles() const
     QSet<QString> seen;
     for (const auto &folder : m_settings.folderPaths) {
         QDirIterator it(folder,
-                    QDir::Files | QDir::Readable | QDir::NoDotAndDotDot,
-                    QDirIterator::Subdirectories);
+                        QDir::Files | QDir::Readable | QDir::NoDotAndDotDot,
+                        QDirIterator::Subdirectories);
         while (it.hasNext()) {
             const QString path = QFileInfo(it.next()).absoluteFilePath();
 #ifdef Q_OS_WIN
