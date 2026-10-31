@@ -45,19 +45,13 @@ FolderSyncService::FolderSyncService(ImmichClient *client, QObject *parent)
     , m_albumBatchTimer(new QTimer(this))
 {
     m_scanTimer->setInterval(kScanIntervalMs);
-    connect(m_scanTimer, &QTimer::timeout, this, &FolderSyncService::periodicScan);
 
     m_stabilityTimer->setInterval(500);
     connect(m_stabilityTimer, &QTimer::timeout, this, &FolderSyncService::processStableFiles);
 
-    m_albumBatchTimer->setInterval(800);
+    m_albumBatchTimer->setInterval(1200);
     m_albumBatchTimer->setSingleShot(true);
-    connect(m_albumBatchTimer, &QTimer::timeout, this, &FolderSyncService::flushBatchedAlbumAssets);
-
-    connect(m_watcher, &QFileSystemWatcher::directoryChanged, this,
-            &FolderSyncService::handleDirectoryChanged);
-    connect(m_watcher, &QFileSystemWatcher::fileChanged, this,
-            &FolderSyncService::handleDirectoryChanged);
+    connect(m_albumBatchTimer, &QTimer::timeout, this, &FolderSyncService::onAlbumBatchTimeout);
 
     connect(m_client, &ImmichClient::uploadProgress, this,
             &FolderSyncService::handleUploadProgress);
@@ -80,8 +74,6 @@ FolderSyncService::FolderSyncService(ImmichClient *client, QObject *parent)
     rebuildWatcher();
     refreshStatus();
     publishLibraryPending();
-    if (m_settings.enabled)
-        QTimer::singleShot(1500, this, &FolderSyncService::scanNow);
 }
 
 FolderSyncSettings FolderSyncService::settings() const
@@ -123,8 +115,6 @@ void FolderSyncService::setSettings(const FolderSyncSettings &settings)
         emit settingsChanged(m_settings);
         refreshStatus();
         publishLibraryPending();
-        if (m_settings.enabled)
-            scanNow();
     } else {
         refreshStatus();
         publishLibraryPending();
@@ -204,10 +194,6 @@ void FolderSyncService::scanNow()
 
 void FolderSyncService::handleDirectoryChanged(const QString &)
 {
-    QTimer::singleShot(300, this, [this] {
-        rebuildWatcher();
-        scanNow();
-    });
 }
 
 void FolderSyncService::handleUploadProgress(const QString &filePath, qint64, qint64)
@@ -224,91 +210,146 @@ void FolderSyncService::queueAssetForAlbum(const QString &albumName, const QStri
     if (albumName.isEmpty() || assetId.isEmpty())
         return;
 
-    if (!m_pendingBatchedAlbumAssets[albumName].contains(assetId))
-        m_pendingBatchedAlbumAssets[albumName].append(assetId);
+    QStringList &list = m_pendingAlbumBatches[albumName];
+    if (!list.contains(assetId))
+        list.append(assetId);
 
-    // Debounce timer restarts so all files in this batch get grouped together
+    // Restart timer cleanly: waits until upload stream quiets down
     m_albumBatchTimer->start();
 }
 
-void FolderSyncService::flushBatchedAlbumAssets()
+void FolderSyncService::onAlbumBatchTimeout()
 {
-    if (m_albumSyncInFlight || m_pendingBatchedAlbumAssets.isEmpty() || !m_client || !m_client->isConfigured())
+    if (m_albumBatchBusy)
         return;
 
-    m_albumSyncInFlight = true;
+    dispatchNextAlbumBatch();
+}
+
+void FolderSyncService::dispatchNextAlbumBatch()
+{
+    if (m_pendingAlbumBatches.isEmpty() || !m_client || !m_client->isConfigured()) {
+        m_albumBatchBusy = false;
+        return;
+    }
+
+    // Pick first album that actually has queued items
+    QString targetAlbum;
+    for (auto it = m_pendingAlbumBatches.begin(); it != m_pendingAlbumBatches.end(); ++it) {
+        if (!it.value().isEmpty()) {
+            targetAlbum = it.key();
+            break;
+        }
+    }
+
+    if (targetAlbum.isEmpty()) {
+        m_pendingAlbumBatches.clear();
+        m_albumBatchBusy = false;
+        return;
+    }
+
+    m_albumBatchBusy = true;
+    const QStringList assetIds = m_pendingAlbumBatches.take(targetAlbum);
+
     const QString apiKey = m_client->connection().apiKey;
     const QString baseServerUrl = m_client->activeServerUrl();
     const QUrl albumsUrl(baseServerUrl + QStringLiteral("/api/albums"));
 
-    // Step 1: Always fetch current existing albums list first to avoid race duplicates
-    QNetworkRequest getRequest(albumsUrl);
-    getRequest.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    getRequest.setRawHeader("x-api-key", apiKey.toUtf8());
+    // Check if we already have the ID in memory
+    const QString lower = targetAlbum.toLower();
+    if (m_knownAlbums.contains(lower)) {
+        const QString albumId = m_knownAlbums.value(lower);
+        QUrl putUrl(QStringLiteral("%1/%2/assets").arg(albumsUrl.toString(), albumId));
+        QNetworkRequest putReq(putUrl);
+        putReq.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        putReq.setRawHeader("x-api-key", apiKey.toUtf8());
 
-    QNetworkReply *getReply = m_albumNam->get(getRequest);
-    connect(getReply, &QNetworkReply::finished, this, [this, getReply, albumsUrl, apiKey]() {
-        QHash<QString, QString> existingAlbums;
+        QJsonObject body;
+        QJsonArray idsArr;
+        for (const QString &id : assetIds)
+            idsArr.append(id);
+        body.insert(QStringLiteral("ids"), idsArr);
+
+        QNetworkReply *putReply = m_albumNam->put(putReq, QJsonDocument(body).toJson(QJsonDocument::Compact));
+        connect(putReply, &QNetworkReply::finished, this, [this, putReply]() {
+            putReply->deleteLater();
+            m_albumBatchBusy = false;
+            // Schedule next batch on next event loop tick
+            QTimer::singleShot(50, this, &FolderSyncService::dispatchNextAlbumBatch);
+        });
+        return;
+    }
+
+    // Otherwise, fetch existing albums once from server
+    QNetworkRequest getReq(albumsUrl);
+    getReq.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    getReq.setRawHeader("x-api-key", apiKey.toUtf8());
+
+    QNetworkReply *getReply = m_albumNam->get(getReq);
+    connect(getReply, &QNetworkReply::finished, this, [this, getReply, albumsUrl, apiKey, targetAlbum, assetIds]() {
+        QString matchedId;
         if (getReply->error() == QNetworkReply::NoError) {
             const QJsonDocument doc = QJsonDocument::fromJson(getReply->readAll());
             if (doc.isArray()) {
                 const QJsonArray arr = doc.array();
                 for (const auto &val : arr) {
                     const QJsonObject obj = val.toObject();
-                    const QString name = obj.value(QStringLiteral("albumName")).toString();
+                    const QString n = obj.value(QStringLiteral("albumName")).toString();
                     const QString id = obj.value(QStringLiteral("id")).toString();
-                    if (!name.isEmpty() && !id.isEmpty())
-                        existingAlbums.insert(name.toLower(), id);
+                    if (!n.isEmpty() && !id.isEmpty()) {
+                        m_knownAlbums.insert(n.toLower(), id);
+                        if (n.compare(targetAlbum, Qt::CaseInsensitive) == 0)
+                            matchedId = id;
+                    }
                 }
             }
         }
         getReply->deleteLater();
 
-        // Step 2: Process each album queue sequentially
-        const auto albumNames = m_pendingBatchedAlbumAssets.keys();
-        for (const QString &albumName : albumNames) {
-            const QStringList ids = m_pendingBatchedAlbumAssets.take(albumName);
-            if (ids.isEmpty())
-                continue;
+        if (!matchedId.isEmpty()) {
+            QUrl putUrl(QStringLiteral("%1/%2/assets").arg(albumsUrl.toString(), matchedId));
+            QNetworkRequest putReq(putUrl);
+            putReq.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+            putReq.setRawHeader("x-api-key", apiKey.toUtf8());
 
-            const QString lower = albumName.toLower();
-            if (existingAlbums.contains(lower)) {
-                // Add all batched assets into existing album in 1 PUT request
-                const QString albumId = existingAlbums.value(lower);
-                QUrl putUrl(QStringLiteral("%1/%2/assets").arg(albumsUrl.toString(), albumId));
-                QNetworkRequest putReq(putUrl);
-                putReq.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-                putReq.setRawHeader("x-api-key", apiKey.toUtf8());
+            QJsonObject body;
+            QJsonArray idsArr;
+            for (const QString &id : assetIds)
+                idsArr.append(id);
+            body.insert(QStringLiteral("ids"), idsArr);
 
-                QJsonObject body;
-                QJsonArray idsArr;
-                for (const QString &id : ids)
-                    idsArr.append(id);
-                body.insert(QStringLiteral("ids"), idsArr);
+            QNetworkReply *putReply = m_albumNam->put(putReq, QJsonDocument(body).toJson(QJsonDocument::Compact));
+            connect(putReply, &QNetworkReply::finished, this, [this, putReply]() {
+                putReply->deleteLater();
+                m_albumBatchBusy = false;
+                QTimer::singleShot(50, this, &FolderSyncService::dispatchNextAlbumBatch);
+            });
+        } else {
+            // Create album
+            QNetworkRequest postReq(albumsUrl);
+            postReq.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+            postReq.setRawHeader("x-api-key", apiKey.toUtf8());
 
-                QNetworkReply *putRep = m_albumNam->put(putReq, QJsonDocument(body).toJson(QJsonDocument::Compact));
-                connect(putRep, &QNetworkReply::finished, putRep, &QNetworkReply::deleteLater);
-            } else {
-                // Create brand new album with all batched assets in 1 POST request
-                QNetworkRequest postReq(albumsUrl);
-                postReq.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-                postReq.setRawHeader("x-api-key", apiKey.toUtf8());
+            QJsonObject body;
+            body.insert(QStringLiteral("albumName"), targetAlbum);
+            QJsonArray idsArr;
+            for (const QString &id : assetIds)
+                idsArr.append(id);
+            body.insert(QStringLiteral("assetIds"), idsArr);
 
-                QJsonObject body;
-                body.insert(QStringLiteral("albumName"), albumName);
-                QJsonArray idsArr;
-                for (const QString &id : ids)
-                    idsArr.append(id);
-                body.insert(QStringLiteral("assetIds"), idsArr);
-
-                QNetworkReply *postRep = m_albumNam->post(postReq, QJsonDocument(body).toJson(QJsonDocument::Compact));
-                connect(postRep, &QNetworkReply::finished, postRep, &QNetworkReply::deleteLater);
-            }
+            QNetworkReply *postReply = m_albumNam->post(postReq, QJsonDocument(body).toJson(QJsonDocument::Compact));
+            connect(postReply, &QNetworkReply::finished, this, [this, postReply, targetAlbum]() {
+                if (postReply->error() == QNetworkReply::NoError) {
+                    const QJsonObject created = QJsonDocument::fromJson(postReply->readAll()).object();
+                    const QString newId = created.value(QStringLiteral("id")).toString();
+                    if (!newId.isEmpty())
+                        m_knownAlbums.insert(targetAlbum.toLower(), newId);
+                }
+                postReply->deleteLater();
+                m_albumBatchBusy = false;
+                QTimer::singleShot(50, this, &FolderSyncService::dispatchNextAlbumBatch);
+            });
         }
-
-        m_albumSyncInFlight = false;
-        if (!m_pendingBatchedAlbumAssets.isEmpty())
-            m_albumBatchTimer->start();
     });
 }
 
@@ -323,7 +364,6 @@ void FolderSyncService::handleAssetUploaded(const QString &filePath, const QStri
     markSynced(filePath);
     m_lastUploadName = QFileInfo(filePath).fileName();
 
-    // Queue asset into batch aggregator (ignores duplicates from loop retries)
     if (!assetId.isEmpty() && !duplicate) {
         const QString albumName = QFileInfo(filePath).dir().dirName();
         queueAssetForAlbum(albumName, assetId);
@@ -346,28 +386,19 @@ void FolderSyncService::handleUploadFailed(const QString &filePath, const QStrin
 void FolderSyncService::handleOnlineChanged(bool)
 {
     refreshStatus();
-    if (canUploadNow())
-        scanNow();
-    else
-        publishLibraryPending();
+    publishLibraryPending();
 }
 
 void FolderSyncService::handleConfigurationChanged(bool)
 {
     refreshStatus();
-    if (canUploadNow())
-        scanNow();
-    else
-        publishLibraryPending();
+    publishLibraryPending();
 }
 
 void FolderSyncService::handleActiveEndpointChanged(bool, const QString &)
 {
     refreshStatus();
-    if (canUploadNow())
-        scanNow();
-    else
-        publishLibraryPending();
+    publishLibraryPending();
 }
 
 void FolderSyncService::processStableFiles()
@@ -416,8 +447,6 @@ void FolderSyncService::processStableFiles()
 
 void FolderSyncService::periodicScan()
 {
-    rebuildWatcher();
-    scanNow();
 }
 
 bool FolderSyncService::isMediaFile(const QString &path)
@@ -571,20 +600,6 @@ void FolderSyncService::rebuildWatcher()
         m_watcher->removePaths(files);
 
     m_scanTimer->stop();
-    if (!m_settings.enabled || m_settings.folderPaths.isEmpty())
-        return;
-    QSet<QString> watched;
-    for (const QString &folder : m_settings.folderPaths) {
-        if (!QDir(folder).exists())
-            continue;
-        watched.insert(folder);
-        QDirIterator it(folder, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
-        while (it.hasNext())
-            watched.insert(it.next());
-    }
-    if (!watched.isEmpty())
-        m_watcher->addPaths(watched.values());
-    m_scanTimer->start();
 }
 
 void FolderSyncService::enqueueReadyFiles(const QStringList &paths)
