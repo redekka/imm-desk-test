@@ -11,6 +11,7 @@
 #include <QStringList>
 
 class QFileSystemWatcher;
+class QNetworkAccessManager;
 class QTimer;
 
 namespace Aurora {
@@ -58,6 +59,7 @@ private slots:
     void handleActiveEndpointChanged(bool usingLocal, const QString &activeUrl);
     void processStableFiles();
     void periodicScan();
+    void flushBatchedAlbumAssets();
 
 private:
     struct PendingFile {
@@ -84,7 +86,7 @@ private:
     void publishLibraryPending();
     QStringList collectMediaFiles() const;
 
-    void addAssetToAlbum(const QString &albumName, const QString &assetId);
+    void queueAssetForAlbum(const QString &albumName, const QString &assetId);
 
     ImmichClient *m_client = nullptr;
     QString m_stateFilePath;
@@ -102,9 +104,11 @@ private:
     QString m_statusMessage;
     QString m_lastUploadName;
 
+    QNetworkAccessManager *m_albumNam = nullptr;
+    QTimer *m_albumBatchTimer = nullptr;
+    QHash<QString, QStringList> m_pendingBatchedAlbumAssets;
     QHash<QString, QString> m_albumIdCache;
-    QHash<QString, QStringList> m_pendingAlbumAssets;
-    QSet<QString> m_resolvingAlbums;
+    bool m_albumSyncInFlight = false;
 };
 
 } // namespace Aurora
