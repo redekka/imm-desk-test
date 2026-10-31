@@ -39,7 +39,6 @@ public:
     QString statusMessage() const;
     QString statusIconPath() const;
 
-    // Unsynced folder files for Library preview (with Unsaved/Saving/Error badge).
     QList<ImmichAsset> pendingLibraryAssets() const;
 
     void scanNow();
@@ -59,7 +58,6 @@ private slots:
     void handleActiveEndpointChanged(bool usingLocal, const QString &activeUrl);
     void processStableFiles();
     void periodicScan();
-    void onAlbumBatchTimeout();
 
 private:
     struct PendingFile {
@@ -86,8 +84,7 @@ private:
     void publishLibraryPending();
     QStringList collectMediaFiles() const;
 
-    void queueAssetForAlbum(const QString &albumName, const QString &assetId);
-    void dispatchNextAlbumBatch();
+    void attachAssetToFolderAlbum(const QString &albumName, const QString &assetId);
 
     ImmichClient *m_client = nullptr;
     QString m_stateFilePath;
@@ -106,10 +103,9 @@ private:
     QString m_lastUploadName;
 
     QNetworkAccessManager *m_albumNam = nullptr;
-    QTimer *m_albumBatchTimer = nullptr;
-    QHash<QString, QStringList> m_pendingAlbumBatches;
-    QHash<QString, QString> m_knownAlbums;
-    bool m_albumBatchBusy = false;
+    QHash<QString, QString> m_albumIdCache;
+    QHash<QString, QStringList> m_queuedAssetsByAlbum;
+    QSet<QString> m_activeAlbumRequests;
 };
 
 } // namespace Aurora
