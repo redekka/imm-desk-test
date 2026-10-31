@@ -8,6 +8,7 @@
 #include <QObject>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 
 class QFileSystemWatcher;
 class QTimer;
@@ -83,6 +84,8 @@ private:
     void publishLibraryPending();
     QStringList collectMediaFiles() const;
 
+    void addAssetToAlbum(const QString &albumName, const QString &assetId);
+
     ImmichClient *m_client = nullptr;
     QString m_stateFilePath;
     AppSettings m_store;
@@ -98,6 +101,10 @@ private:
     FolderSyncUiStatus m_uiStatus = FolderSyncUiStatus::Disabled;
     QString m_statusMessage;
     QString m_lastUploadName;
+
+    QHash<QString, QString> m_albumIdCache;
+    QHash<QString, QStringList> m_pendingAlbumAssets;
+    QSet<QString> m_resolvingAlbums;
 };
 
 } // namespace Aurora
